@@ -252,6 +252,35 @@ async def _tts(text: str) -> bytes:
         return r.content
 
 
+# Turn-taking lives in turn.py so it can be tested without a phone call. Imported here
+# rather than at the top of the file to keep this one contiguous change.
+from turn import GATE_SYSTEM, TurnState, looks_complete
+
+
+async def _gate_verdict(text: str) -> bool:
+    """One short model call: has the caller finished their turn?
+
+    Only reached for the ambiguous middle, after looks_complete() gave up. Any failure
+    answers "done": the alternative leaves the caller in silence, and the hard-silence cap
+    in turn.py already bounds how long a wrong WAIT can stall a turn.
+    """
+    body = {"model": os.getenv("GATE_MODEL", CFG["llm_model"]), "max_tokens": 4,
+            "temperature": 0,
+            "messages": [{"role": "system", "content": GATE_SYSTEM},
+                         {"role": "user", "content": text}]}
+    try:
+        async with httpx.AsyncClient(timeout=6) as c:
+            r = await c.post(f"{CFG['or_base']}/chat/completions",
+                             headers={"Authorization": f"Bearer {CFG['openrouter_api_key']}"},
+                             json=body)
+            r.raise_for_status()
+            word = (r.json()["choices"][0]["message"]["content"] or "").strip().upper()
+    except Exception as exc:
+        LOG.warning("gate call failed (%s); assuming the caller finished", exc)
+        return True
+    return "WAIT" not in word
+
+
 @app.websocket("/telnyx/media")
 async def media_ws(ws: WebSocket):
     await ws.accept()
@@ -263,57 +292,87 @@ async def media_ws(ws: WebSocket):
         ws.query_params.get("token") == CFG["stream_auth_token"]
 
     call_id: Optional[str] = None
-    speaking = False
-    frames: Deque[bytes] = deque(maxlen=2000)
-    silence_ms = 0
-    speech_seen = False
     history: list = []
     started = time.time()
+    state = TurnState()
+    turn_task: Optional[asyncio.Task] = None
 
-    turn_busy = False
+    async def run_turn(epoch: int, audio: bytes, held: str, force: bool,
+                       pre_text: Optional[str] = None) -> None:
+        """One utterance, one pass, at most one reply.
 
-    async def turn() -> None:
-        """One turn at a time.
-
-        An energy VAD fires on every ~700ms pause, so a live call easily starts a
-        second turn while the first is still generating speech. Left alone the
-        replies interleave, play out of order and answer sentence fragments. The
-        guard serializes them: audio that arrived meanwhile stays in `frames` and
-        is handled on the next pass.
+        `pre_text` is set when the utterance is already fully transcribed (a held utterance
+        the caller never continued), so there is no new audio to send through STT.
         """
-        nonlocal speaking, speech_seen, silence_ms, turn_busy
-        if turn_busy:
-            return
-        turn_busy = True
         try:
-            while sum(map(len, frames)) >= 4000:      # ~0.5s of 8kHz PCMU
-                audio = b"".join(frames)
-                frames.clear()
-                speech_seen = False
-                silence_ms = 0
+            if pre_text is not None:
+                text, full = pre_text, pre_text
+            else:
                 try:
-                    text = await _stt(audio)
+                    text = (await _stt(audio)).strip()
                 except Exception as exc:
                     LOG.warning("stt failed: %s", exc)
-                    continue
+                    state.verdict_empty()
+                    return
+                if state.superseded(epoch):
+                    LOG.info("pass superseded before transcription finished; caller kept talking")
+                    return
                 if not text:
-                    continue
-                LOG.info("caller said: %s", text[:300])
-                history.append({"role": "user", "content": text})
-                try:
-                    reply = await _llm(history)
-                    history.append({"role": "assistant", "content": reply})
-                    LOG.info("replying: %s", reply[:300])
-                    mp3 = await _tts(reply)
-                except Exception as exc:
-                    LOG.warning("llm/tts failed: %s", exc)
-                    continue
-                speaking = True
-                await ws.send_text(json.dumps({"event": "media", "media": {
-                    "payload": base64.b64encode(mp3).decode()}}))
-                await ws.send_text(json.dumps({"event": "mark", "mark": {"name": "speech-end"}}))
-        finally:
-            turn_busy = False
+                    state.verdict_empty()
+                    return
+                full = state.utterance_text(text)
+            LOG.info("caller said: %s", full[:300])
+            if not force:
+                verdict = looks_complete(text)
+                if verdict is None:
+                    verdict = await _gate_verdict(full)
+                if verdict is False:
+                    # Mid-thought. Hold the transcript and keep listening rather than
+                    # answering a fragment: this is the fix for the three-reply bug.
+                    state.verdict_wait(text)
+                    LOG.info("holding turn, caller still mid-thought: %s", full[:160])
+                    return
+            state.verdict_reply()
+            history.append({"role": "user", "content": full})
+            try:
+                reply = await _llm(history)
+            except Exception as exc:
+                LOG.warning("llm failed: %s", exc)
+                history.pop()
+                state.playback_finished()
+                return
+            if state.superseded(epoch):
+                # They resumed while we were thinking. Drop the reply instead of talking
+                # over them; the held transcript is already cleared, so the next pass
+                # answers the full new utterance.
+                LOG.info("reply dropped, caller resumed: %s", reply[:120])
+                history.pop()
+                state.playback_finished()
+                return
+            history.append({"role": "assistant", "content": reply})
+            LOG.info("replying: %s", reply[:300])
+            try:
+                mp3 = await _tts(reply)
+            except Exception as exc:
+                LOG.warning("tts failed: %s", exc)
+                state.playback_finished()
+                return
+            if state.superseded(epoch):
+                LOG.info("reply dropped after synthesis, caller resumed")
+                state.playback_finished()
+                return
+            state.playback_started()
+            await ws.send_text(json.dumps({"event": "media", "media": {
+                "payload": base64.b64encode(mp3).decode()}}))
+            await ws.send_text(json.dumps({"event": "mark",
+                                           "mark": {"name": "speech-end"}}))
+        except asyncio.CancelledError:
+            LOG.info("turn cancelled: caller spoke over generation")
+            state.playback_finished()
+            raise
+        except Exception as exc:
+            LOG.warning("turn failed: %s", exc)
+            state.verdict_empty()
 
     try:
         while True:
@@ -335,9 +394,8 @@ async def media_ws(ws: WebSocket):
                 greet = os.getenv("GREETING", "").strip()
                 if greet and call_id:
                     async def _greet(text: str) -> None:
-                        nonlocal speaking
                         try:
-                            speaking = True
+                            state.playback_started()
                             mp3 = await _tts(text)
                             await ws.send_text(json.dumps({"event": "media",
                                 "media": {"payload": base64.b64encode(mp3).decode()}}))
@@ -345,7 +403,7 @@ async def media_ws(ws: WebSocket):
                                 "mark": {"name": "greeting-end"}}))
                         except Exception as exc:
                             LOG.warning("greeting failed: %s", exc)
-                            speaking = False
+                            state.playback_finished()
                     asyncio.create_task(_greet(greet))
             elif ev == "media":
                 incoming = msg.get("media", {})
@@ -353,21 +411,27 @@ async def media_ws(ws: WebSocket):
                     continue
                 pcm_chunk = base64.b64decode(incoming.get("payload", ""))
                 level = _rms_mulaw(pcm_chunk)
-                chunk_ms = int(len(pcm_chunk) / 8)          # PCMU @ 8kHz = 8 bytes/ms
-                if level > 500:
-                    if speaking:                            # barge-in
+                # TurnState owns every timing decision now; this loop only executes the
+                # actions it hands back.
+                for act in state.push(level, pcm_chunk):
+                    kind = act["type"]
+                    if kind == "barge_in":
                         await ws.send_text(json.dumps({"event": "clear"}))
-                        speaking = False
-                    speech_seen = True
-                    silence_ms = 0
-                    frames.append(pcm_chunk)
-                elif speech_seen:
-                    silence_ms += chunk_ms
-                    frames.append(pcm_chunk)
-                    if silence_ms >= 700:
-                        asyncio.create_task(turn())
+                    elif kind == "cancel":
+                        if turn_task and not turn_task.done():
+                            turn_task.cancel()
+                    elif kind == "evaluate":
+                        epoch, audio, held = state.begin_pass()
+                        turn_task = asyncio.create_task(
+                            run_turn(epoch, audio, held, act["force"]))
+                    elif kind == "force_reply":
+                        # Held utterance the caller never continued: answer with the
+                        # transcript we already have rather than leaving dead air.
+                        epoch, full = state.begin_forced_pass()
+                        turn_task = asyncio.create_task(
+                            run_turn(epoch, b"", "", True, pre_text=full))
             elif ev == "mark":
-                speaking = False
+                state.playback_finished()
             elif ev == "dtmf":
                 LOG.info("dtmf %s", msg.get("dtmf", {}).get("digit"))
             elif ev == "error":
@@ -379,3 +443,6 @@ async def media_ws(ws: WebSocket):
         LOG.info("media socket closed call=%s", call_id)
     except Exception as exc:
         LOG.warning("media socket failure: %s", exc)
+    finally:
+        if turn_task and not turn_task.done():
+            turn_task.cancel()
