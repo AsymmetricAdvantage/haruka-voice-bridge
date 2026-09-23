@@ -123,7 +123,7 @@ async def telnyx_events(request: Request):
     elif etype == "message.received":
         frm = (payload.get("from") or {}).get("phone_number")
         LOG.info("sms.received from=%s id=%s", frm, payload.get("id"))
-        await _forward_sms(frm, payload.get("text", ""))
+        await _forward_sms(frm, payload.get("text", ""), payload.get("id"))
     elif etype in ("message.sent", "message.finalized"):
         LOG.info("%s id=%s status=%s", etype, payload.get("id"),
                  [t.get("status") for t in (payload.get("to") or [])])
@@ -132,10 +132,45 @@ async def telnyx_events(request: Request):
     return {"ok": True}
 
 
-async def _forward_sms(frm: Optional[str], text: str) -> None:
-    """Push inbound SMS to the configured Telegram chat. Logged only if unset."""
+async def _forward_sms(frm: Optional[str], text: str, message_id: Optional[str] = None) -> None:
+    """Hand an inbound SMS to Hermes so it lands in the agent's own context.
+
+    Posting to the Hermes webhook route triggers an agent run (constrained toolset,
+    because SMS content is untrusted) and delivers the reply to Telegram. A direct
+    Telegram notification is the fallback so a text is never silently dropped.
+    """
+    url = os.getenv("HERMES_WEBHOOK_URL", "").strip()
+    secret = os.getenv("HERMES_WEBHOOK_SECRET", "").strip()
+    if url and secret:
+        import hashlib
+        import hmac as _hmac
+        body = json.dumps({
+            "event_type": "sms.received",
+            "from": frm or "",
+            "text": text or "",
+            "message_id": message_id or "",
+            "received_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }, separators=(",", ":"))
+        ts = str(int(time.time()))
+        # Hermes "Generic V2" scheme: hex HMAC-SHA256 over "<timestamp>.<body>".
+        sig = _hmac.new(secret.encode(), f"{ts}.{body}".encode(),
+                        hashlib.sha256).hexdigest()
+        headers = {"Content-Type": "application/json",
+                   "X-Webhook-Signature-V2": sig,
+                   "X-Webhook-Timestamp": ts}
+        if message_id:
+            headers["X-Request-ID"] = str(message_id)
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.post(url, content=body, headers=headers)
+            LOG.info("sms forwarded to hermes: %s %s", r.status_code, r.text[:140])
+            if r.status_code < 300:
+                return
+        except Exception as exc:
+            LOG.warning("hermes forward failed: %s", exc)
+
     if not (CFG["telegram_token"] and CFG["telegram_chat"]):
-        LOG.info("inbound sms (no telegram target configured): %s | %s", frm, text[:200])
+        LOG.info("inbound sms (no target reachable): %s | %s", frm, text[:200])
         return
     try:
         async with httpx.AsyncClient(timeout=10) as c:

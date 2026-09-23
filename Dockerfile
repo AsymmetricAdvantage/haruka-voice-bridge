@@ -4,7 +4,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+COPY app.py test_forward.py ./
 
 # webhook + websocket both ride this port; TLS terminates at the Coolify proxy
 EXPOSE 8080

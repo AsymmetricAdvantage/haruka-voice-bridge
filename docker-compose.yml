@@ -12,3 +12,14 @@ services:
     restart: unless-stopped
     expose:
       - "8080"
+    # Joined to Coolify's shared network so inbound SMS can be handed to the Hermes
+    # gateway (which lives on `coolify`) without exposing the webhook port publicly.
+    networks:
+      default: {}
+      coolify:
+        aliases: [haruka-voice-bridge]
+
+networks:
+  default:
+  coolify:
+    external: true
