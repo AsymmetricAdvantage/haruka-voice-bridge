@@ -135,13 +135,15 @@ async def telnyx_events(request: Request):
 async def _forward_sms(frm: Optional[str], text: str, message_id: Optional[str] = None) -> None:
     """Hand an inbound SMS to Hermes so it lands in the agent's own context.
 
-    Posting to the Hermes webhook route triggers an agent run (constrained toolset,
-    because SMS content is untrusted) and delivers the reply to Telegram. A direct
-    Telegram notification is the fallback so a text is never silently dropped.
+    Posting to the Hermes webhook route triggers an agent run, which can reply to the
+    sender by text via the Telnyx API. Only numbers on SMS_AGENT_ALLOWLIST get an agent
+    run: that route now holds real tool access, so an unknown sender must not be able to
+    reach it. Anything off-list still surfaces as a plain notification.
     """
     url = os.getenv("HERMES_WEBHOOK_URL", "").strip()
     secret = os.getenv("HERMES_WEBHOOK_SECRET", "").strip()
-    if url and secret:
+    allow = [s.strip() for s in os.getenv("SMS_AGENT_ALLOWLIST", "").split(",") if s.strip()]
+    if url and secret and (not allow or frm in allow):
         import hashlib
         import hmac as _hmac
         body = json.dumps({
