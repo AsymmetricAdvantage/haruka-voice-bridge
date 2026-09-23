@@ -1,0 +1,14 @@
+# NOTE: deliberately NO `environment:` block here.
+#
+# Coolify renders this compose and injects `env_file: .env`, generating that file from
+# the env vars set on the resource. Compose `${VAR}` interpolation does NOT read those
+# vars, so declaring `FOO: '${FOO:-}'` here would hand the container an EMPTY string and
+# silently break every credential. Env comes from Coolify; the compose stays clean.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    expose:
+      - "8080"
