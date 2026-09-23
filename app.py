@@ -218,10 +218,12 @@ async def _tts(text: str) -> bytes:
 @app.websocket("/telnyx/media")
 async def media_ws(ws: WebSocket):
     await ws.accept()
-    if CFG["stream_auth_token"] and ws.query_params.get("token") not in (None, CFG["stream_auth_token"]):
-        LOG.warning("media socket rejected: bad token")
-        await ws.close(code=1008)
-        return
+    # Two independent signals admit a stream: a matching per-call token, or a call id
+    # this process already knows about from a verified webhook. Needing both would
+    # break the stream whenever a webhook is slow; needing neither exposes a socket
+    # that anyone who guesses the URL could talk into.
+    token_ok = bool(CFG["stream_auth_token"]) and \
+        ws.query_params.get("token") == CFG["stream_auth_token"]
 
     call_id: Optional[str] = None
     speaking = False
@@ -268,10 +270,30 @@ async def media_ws(ws: WebSocket):
                 call_id = msg.get("start", {}).get("call_control_id")
                 fmt = msg.get("start", {}).get("media_format", {})
                 LOG.info("media started call=%s format=%s", call_id, fmt)
-                if CFG["stream_auth_token"] and call_id and call_id not in LIVE_CALLS:
-                    LOG.warning("media socket for unknown call %s", call_id)
+                if not token_ok and call_id not in LIVE_CALLS:
+                    LOG.warning("media socket rejected: unknown call %s, no valid token", call_id)
                     await ws.close(code=1008)
                     return
+                if call_id:
+                    LIVE_CALLS.setdefault(call_id, time.time())
+                # While a media stream is active, speak/playback commands are refused
+                # (error 90045), so the opening line has to travel over this socket as
+                # an mp3 frame like every other utterance.
+                greet = os.getenv("GREETING", "").strip()
+                if greet and call_id:
+                    async def _greet(text: str) -> None:
+                        nonlocal speaking
+                        try:
+                            speaking = True
+                            mp3 = await _tts(text)
+                            await ws.send_text(json.dumps({"event": "media",
+                                "media": {"payload": base64.b64encode(mp3).decode()}}))
+                            await ws.send_text(json.dumps({"event": "mark",
+                                "mark": {"name": "greeting-end"}}))
+                        except Exception as exc:
+                            LOG.warning("greeting failed: %s", exc)
+                            speaking = False
+                    asyncio.create_task(_greet(greet))
             elif ev == "media":
                 incoming = msg.get("media", {})
                 if incoming.get("track") == "outbound":
