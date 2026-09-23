@@ -233,34 +233,50 @@ async def media_ws(ws: WebSocket):
     history: list = []
     started = time.time()
 
+    turn_busy = False
+
     async def turn() -> None:
-        nonlocal speaking, speech_seen
-        audio = b"".join(frames)
-        frames.clear()
-        speech_seen = False
-        if len(audio) < 8000 // 2:      # under ~0.5s of audio, not worth transcribing
+        """One turn at a time.
+
+        An energy VAD fires on every ~700ms pause, so a live call easily starts a
+        second turn while the first is still generating speech. Left alone the
+        replies interleave, play out of order and answer sentence fragments. The
+        guard serializes them: audio that arrived meanwhile stays in `frames` and
+        is handled on the next pass.
+        """
+        nonlocal speaking, speech_seen, silence_ms, turn_busy
+        if turn_busy:
             return
+        turn_busy = True
         try:
-            text = await _stt(audio)
-        except Exception as exc:
-            LOG.warning("stt failed: %s", exc)
-            return
-        if not text:
-            return
-        LOG.info("caller said: %s", text[:300])
-        history.append({"role": "user", "content": text})
-        try:
-            reply = await _llm(history)
-            history.append({"role": "assistant", "content": reply})
-            LOG.info("replying: %s", reply[:300])
-            mp3 = await _tts(reply)
-        except Exception as exc:
-            LOG.warning("llm/tts failed: %s", exc)
-            return
-        speaking = True
-        await ws.send_text(json.dumps({"event": "media", "media": {
-            "payload": base64.b64encode(mp3).decode()}}))
-        await ws.send_text(json.dumps({"event": "mark", "mark": {"name": "speech-end"}}))
+            while sum(map(len, frames)) >= 4000:      # ~0.5s of 8kHz PCMU
+                audio = b"".join(frames)
+                frames.clear()
+                speech_seen = False
+                silence_ms = 0
+                try:
+                    text = await _stt(audio)
+                except Exception as exc:
+                    LOG.warning("stt failed: %s", exc)
+                    continue
+                if not text:
+                    continue
+                LOG.info("caller said: %s", text[:300])
+                history.append({"role": "user", "content": text})
+                try:
+                    reply = await _llm(history)
+                    history.append({"role": "assistant", "content": reply})
+                    LOG.info("replying: %s", reply[:300])
+                    mp3 = await _tts(reply)
+                except Exception as exc:
+                    LOG.warning("llm/tts failed: %s", exc)
+                    continue
+                speaking = True
+                await ws.send_text(json.dumps({"event": "media", "media": {
+                    "payload": base64.b64encode(mp3).decode()}}))
+                await ws.send_text(json.dumps({"event": "mark", "mark": {"name": "speech-end"}}))
+        finally:
+            turn_busy = False
 
     try:
         while True:
