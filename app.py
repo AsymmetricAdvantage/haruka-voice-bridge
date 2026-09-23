@@ -260,25 +260,39 @@ from turn import GATE_SYSTEM, TurnState, looks_complete
 async def _gate_verdict(text: str) -> bool:
     """One short model call: has the caller finished their turn?
 
-    Only reached for the ambiguous middle, after looks_complete() gave up. Any failure
-    answers "done": the alternative leaves the caller in silence, and the hard-silence cap
-    in turn.py already bounds how long a wrong WAIT can stall a turn.
+    Only reached for the ambiguous middle, after looks_complete() gave up. Runs against
+    whatever GATE_BASE/GATE_KEY/GATE_MODEL are configured, defaulting to the same
+    OpenRouter credentials as the rest of the pipeline, with a short timeout so a slow or
+    broken provider cannot stall the turn. This matters: the default LLM here answers this
+    in 3-7 seconds, which is worse than not asking at all. A fast small model answers in
+    roughly 450ms.
+
+    Failure, timeout and an unusable word all answer "not finished", which holds the
+    utterance for the hard-silence cap to resolve. That is the safe direction: a late
+    answer is awkward, an answer to half a sentence is the bug this exists to prevent.
     """
-    body = {"model": os.getenv("GATE_MODEL", CFG["llm_model"]), "max_tokens": 4,
+    base = os.getenv("GATE_BASE", CFG["or_base"]).rstrip("/")
+    key = os.getenv("GATE_KEY", CFG["openrouter_api_key"])
+    timeout = float(os.getenv("GATE_TIMEOUT_S", "1.5"))
+    body = {"model": os.getenv("GATE_MODEL", CFG["llm_model"]), "max_tokens": 8,
             "temperature": 0,
             "messages": [{"role": "system", "content": GATE_SYSTEM},
                          {"role": "user", "content": text}]}
     try:
-        async with httpx.AsyncClient(timeout=6) as c:
-            r = await c.post(f"{CFG['or_base']}/chat/completions",
-                             headers={"Authorization": f"Bearer {CFG['openrouter_api_key']}"},
-                             json=body)
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.post(f"{base}/chat/completions",
+                             headers={"Authorization": f"Bearer {key}"}, json=body)
             r.raise_for_status()
             word = (r.json()["choices"][0]["message"]["content"] or "").strip().upper()
     except Exception as exc:
-        LOG.warning("gate call failed (%s); assuming the caller finished", exc)
+        LOG.warning("gate call failed (%s); holding the utterance", exc)
+        return False
+    if "DONE" in word:
         return True
-    return "WAIT" not in word
+    if "WAIT" in word:
+        return False
+    LOG.warning("gate returned an unusable verdict %r; holding the utterance", word[:40])
+    return False
 
 
 @app.websocket("/telnyx/media")
