@@ -29,7 +29,9 @@ from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 
 LOG = logging.getLogger("haruka")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
+# Case-proof: an env value of "info" would otherwise raise ValueError and kill the
+# container on import, which is exactly how the first deploy crash-looped.
+logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 CFG = {
