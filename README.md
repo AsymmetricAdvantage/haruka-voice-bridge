@@ -28,7 +28,7 @@ Telnyx media stream ──> µ-law 8kHz ──> WAV(PCM16) ──> STT (OpenRout
 | `TELNYX_PUBLIC_KEY` | Account public key from Mission Control (API Keys → Public Key). Used to verify webhooks. |
 | `TELNYX_API_KEY` | Only needed for outbound dialing / replies. |
 | `OPENROUTER_API_KEY` | STT, LLM and TTS calls. |
-| `STT_MODEL` / `TTS_MODEL` / `TTS_VOICE` / `LLM_MODEL` | Model selection. Defaults: `x-ai/grok-stt-1.0`, `x-ai/grok-voice-tts-1.0`, `ara`, `x-ai/grok-4.6`. |
+| `STT_MODEL` / `TTS_MODEL` / `TTS_VOICE` / `LLM_MODEL` | Model selection. Defaults: `microsoft/mai-transcribe-2`, `x-ai/grok-voice-tts-1.0`, `ara`, `deepseek/deepseek-v4.1-flash-1017:nitro`. |
 | `STREAM_AUTH_TOKEN` | Passed to Telnyx as `stream_auth_token`; also checked as `?token=` on the media socket. |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Optional. Forwards inbound SMS to a chat. |
 

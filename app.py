@@ -39,10 +39,10 @@ CFG = {
     "telnyx_public_key": os.getenv("TELNYX_PUBLIC_KEY", ""),
     "openrouter_api_key": os.getenv("OPENROUTER_API_KEY", ""),
     "or_base": os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1").rstrip("/"),
-    "stt_model": os.getenv("STT_MODEL", "x-ai/grok-stt-1.0"),
+    "stt_model": os.getenv("STT_MODEL", "microsoft/mai-transcribe-2"),
     "tts_model": os.getenv("TTS_MODEL", "x-ai/grok-voice-tts-1.0"),
     "tts_voice": os.getenv("TTS_VOICE", "ara"),
-    "llm_model": os.getenv("LLM_MODEL", "x-ai/grok-4.6"),
+    "llm_model": os.getenv("LLM_MODEL", "deepseek/deepseek-v4.1-flash-1017:nitro"),
     "stream_auth_token": os.getenv("STREAM_AUTH_TOKEN", ""),
     "telegram_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
     "telegram_chat": os.getenv("TELEGRAM_CHAT_ID", ""),
@@ -233,7 +233,13 @@ async def _stt(mulaw: bytes) -> str:
 
 
 async def _llm(history: list) -> str:
-    body = {"model": CFG["llm_model"], "max_tokens": 220, "temperature": 0.7,
+    body = {"model": CFG["llm_model"],
+            "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "300")),
+            "temperature": 0.7,
+            # DeepSeek v4.1 Flash is a reasoning model. Left on it spends the output budget
+            # thinking and returns EMPTY content on a phone-sized cap, and it measured 3-5x
+            # slower per turn. A spoken reply does not need reasoning before the first token.
+            "reasoning": {"enabled": False},
             "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + history}
     async with httpx.AsyncClient(timeout=45) as c:
         r = await c.post(f"{CFG['or_base']}/chat/completions",
@@ -276,6 +282,11 @@ async def _gate_verdict(text: str) -> bool:
     timeout = float(os.getenv("GATE_TIMEOUT_S", "1.5"))
     body = {"model": os.getenv("GATE_MODEL", CFG["llm_model"]), "max_tokens": 8,
             "temperature": 0,
+            # Same trap as _llm, and worse here: an 8-token cap on a reasoning model is
+            # consumed entirely by thinking, so the verdict comes back empty and every
+            # ambiguous utterance is held. With reasoning off the same model answers in ~3
+            # tokens and ~260ms, which is what makes it usable inside this 1.5s budget.
+            "reasoning": {"enabled": False},
             "messages": [{"role": "system", "content": GATE_SYSTEM},
                          {"role": "user", "content": text}]}
     try:
