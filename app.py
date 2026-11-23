@@ -232,20 +232,41 @@ async def _stt(mulaw: bytes) -> str:
         return (r.json().get("text") or "").strip()
 
 
+def _reasoning_param() -> dict:
+    """Reasoning setting for the reply model.
+
+    On by default at LOW effort. Reasoning measurably improved the reply on an incomplete
+    request (it asked for the correct PO number instead of inventing a fix) and cost about
+    0.1s, which is noise next to the turn budget. `LLM_REASONING=off` disables it,
+    low/medium/high changes the effort.
+    """
+    mode = (os.getenv("LLM_REASONING", "low") or "low").strip().lower()
+    if mode in ("off", "0", "false", "none", "disabled"):
+        return {"enabled": False}
+    return {"effort": mode}
+
+
 async def _llm(history: list) -> str:
-    body = {"model": CFG["llm_model"],
-            "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "300")),
-            "temperature": 0.7,
-            # DeepSeek v4.1 Flash is a reasoning model. Left on it spends the output budget
-            # thinking and returns EMPTY content on a phone-sized cap, and it measured 3-5x
-            # slower per turn. A spoken reply does not need reasoning before the first token.
-            "reasoning": {"enabled": False},
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + history}
+    # Two attempts: reasoning first, then reasoning off. A reasoning pass can consume the
+    # whole output budget and come back with EMPTY content, and an empty string here is
+    # read aloud as silence, so the fallback is what makes enabling reasoning safe.
+    attempts = [_reasoning_param(), {"enabled": False}]
     async with httpx.AsyncClient(timeout=45) as c:
-        r = await c.post(f"{CFG['or_base']}/chat/completions",
-                         headers={"Authorization": f"Bearer {CFG['openrouter_api_key']}"}, json=body)
-        r.raise_for_status()
-        return (r.json()["choices"][0]["message"]["content"] or "").strip()
+        for i, reasoning in enumerate(attempts):
+            body = {"model": CFG["llm_model"],
+                    "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "600")),
+                    "temperature": 0.7,
+                    "reasoning": reasoning,
+                    "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + history}
+            r = await c.post(f"{CFG['or_base']}/chat/completions",
+                             headers={"Authorization": f"Bearer {CFG['openrouter_api_key']}"}, json=body)
+            r.raise_for_status()
+            text = (r.json()["choices"][0]["message"]["content"] or "").strip()
+            if text:
+                return text
+            if i == 0:
+                LOG.warning("empty reply with reasoning on; retrying with reasoning off")
+    return ""
 
 
 async def _tts(text: str) -> bytes:
